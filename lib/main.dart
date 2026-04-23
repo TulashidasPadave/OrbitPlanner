@@ -21,6 +21,7 @@ class OrbitApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      title: 'Orbit Planner',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF02040A),
@@ -34,7 +35,9 @@ class OrbitApp extends StatelessWidget {
 }
 
 enum BodyType { sun, planet, moon }
+
 enum MapMode { system, focused }
+
 enum AttachmentType { image, document }
 
 class NoteAttachment {
@@ -59,6 +62,8 @@ class Body {
   Body? parent;
 
   double orbitRadius;
+  double orbitHeight;
+  double orbitTilt;
   double angle;
   double speed;
   Color color;
@@ -73,11 +78,15 @@ class Body {
     required this.type,
     this.parent,
     required this.orbitRadius,
+    double? orbitHeight,
+    double? orbitTilt,
     required this.angle,
     required this.speed,
     this.color = Colors.white,
     this.isCompleted = false,
-  }) : attachments = attachments ?? [];
+  }) : orbitHeight = orbitHeight ?? orbitRadius,
+       orbitTilt = orbitTilt ?? 0,
+       attachments = attachments ?? [];
 }
 
 class JournalEntry {
@@ -91,6 +100,132 @@ class JournalEntry {
     this.deadline,
     this.deadlineAlertShown = false,
   });
+}
+
+bool _isCompactViewport(Size viewportSize) {
+  return min(viewportSize.width, viewportSize.height) < 700;
+}
+
+double _moonColumnOffsetPx(Size viewportSize) {
+  final desiredOffset =
+      viewportSize.width * (_isCompactViewport(viewportSize) ? 0.24 : 0.28);
+  return desiredOffset.clamp(140.0, 220.0);
+}
+
+double _moonRowSpacing(Size viewportSize) {
+  return _isCompactViewport(viewportSize) ? 84.0 : 100.0;
+}
+
+const List<({String label, Color color})> _planetColorOptions = [
+  (label: "Ocean Blue", color: Colors.blue),
+  (label: "Emerald Green", color: Colors.green),
+  (label: "Solar Red", color: Colors.red),
+  (label: "Royal Purple", color: Colors.purple),
+  (label: "Ice Cyan", color: Colors.cyan),
+  (label: "Amber Gold", color: Colors.amber),
+];
+
+Offset _focusedMoonTargetPosition({
+  required Body moon,
+  required Body selectedPlanet,
+  required List<Body> bodies,
+  required Size viewportSize,
+  required double zoomLevel,
+}) {
+  final moons = bodies
+      .where(
+        (body) => body.parent == selectedPlanet && body.type == BodyType.moon,
+      )
+      .toList();
+  final index = moons.indexOf(moon);
+  if (index == -1) return moon.position;
+
+  final safeZoom = zoomLevel <= 0 ? 1.0 : zoomLevel;
+  final columnX =
+      selectedPlanet.position.dx -
+      (_moonColumnOffsetPx(viewportSize) / safeZoom);
+  final rowSpacing = _moonRowSpacing(viewportSize);
+  final columnY =
+      selectedPlanet.position.dy -
+      ((moons.length - 1) * rowSpacing) / 2 +
+      index * rowSpacing;
+
+  return Offset(columnX, columnY);
+}
+
+Offset _resolvedBodyPosition({
+  required Body body,
+  required Body? selected,
+  required MapMode mode,
+  required List<Body> bodies,
+  required Size viewportSize,
+  required double zoomLevel,
+  required double focusProgress,
+}) {
+  if (mode == MapMode.focused &&
+      selected != null &&
+      body.parent == selected &&
+      body.type == BodyType.moon) {
+    final target = _focusedMoonTargetPosition(
+      moon: body,
+      selectedPlanet: selected,
+      bodies: bodies,
+      viewportSize: viewportSize,
+      zoomLevel: zoomLevel,
+    );
+    return Offset.lerp(body.position, target, focusProgress)!;
+  }
+
+  return body.position;
+}
+
+Offset _orbitalPosition(Body body) {
+  final parent = body.parent;
+  if (parent == null) return body.position;
+
+  final orbitX = cos(body.angle) * body.orbitRadius;
+  final orbitY = sin(body.angle) * body.orbitHeight;
+  final cosTilt = cos(body.orbitTilt);
+  final sinTilt = sin(body.orbitTilt);
+
+  return Offset(
+    parent.position.dx + orbitX * cosTilt - orbitY * sinTilt,
+    parent.position.dy + orbitX * sinTilt + orbitY * cosTilt,
+  );
+}
+
+double _stableUnitFromString(String value) {
+  final hash = value.codeUnits.fold<int>(0, (total, unit) => total + unit);
+  return (hash % 1000) / 1000;
+}
+
+double _planetSafetyRadius(Body body) {
+  return body.type == BodyType.planet ? 72.0 : 0.0;
+}
+
+double _bestPlanetStartAngle(List<Body> siblingPlanets) {
+  if (siblingPlanets.isEmpty) {
+    return 0;
+  }
+
+  final siblingAngles = siblingPlanets.map((planet) => planet.angle).toList()
+    ..sort();
+  double bestAngle = siblingAngles.first + pi;
+  double largestGap = 0;
+
+  for (int i = 0; i < siblingAngles.length; i++) {
+    final current = siblingAngles[i];
+    final next = i == siblingAngles.length - 1
+        ? siblingAngles.first + pi * 2
+        : siblingAngles[i + 1];
+    final gap = next - current;
+    if (gap > largestGap) {
+      largestGap = gap;
+      bestAngle = current + gap / 2;
+    }
+  }
+
+  return bestAngle % (pi * 2);
 }
 
 class OrbitScreen extends StatefulWidget {
@@ -146,7 +281,9 @@ class _OrbitScreenState extends State<OrbitScreen>
   void updateSystem() {
     Body? frozenPlanet;
     if (mode == MapMode.focused && selected != null) {
-      frozenPlanet = selected!.type == BodyType.planet ? selected : selected!.parent;
+      frozenPlanet = selected!.type == BodyType.planet
+          ? selected
+          : selected!.parent;
     }
 
     for (final b in bodies) {
@@ -158,11 +295,35 @@ class _OrbitScreenState extends State<OrbitScreen>
       }
 
       b.angle += b.speed;
-      final parent = b.parent!;
-      b.position = Offset(
-        parent.position.dx + cos(b.angle) * b.orbitRadius,
-        parent.position.dy + sin(b.angle) * b.orbitRadius,
-      );
+      b.position = _orbitalPosition(b);
+    }
+
+    final suns = bodies.where((b) => b.type == BodyType.sun).toList();
+    for (final sun in suns) {
+      final planets = bodies
+          .where((b) => b.parent == sun && b.type == BodyType.planet)
+          .toList();
+      for (int i = 0; i < planets.length; i++) {
+        for (int j = i + 1; j < planets.length; j++) {
+          final a = planets[i];
+          final b = planets[j];
+          final minDistance = _planetSafetyRadius(a) + _planetSafetyRadius(b);
+          final distance = (a.position - b.position).distance;
+          if (distance >= minDistance || distance == 0) continue;
+
+          final separation = (minDistance - distance) / minDistance;
+          final push = max(0.002, separation * 0.035);
+          if (a.orbitRadius <= b.orbitRadius) {
+            a.angle -= push;
+            b.angle += push;
+          } else {
+            a.angle += push;
+            b.angle -= push;
+          }
+          a.position = _orbitalPosition(a);
+          b.position = _orbitalPosition(b);
+        }
+      }
     }
 
     if (mode == MapMode.focused) {
@@ -183,10 +344,19 @@ class _OrbitScreenState extends State<OrbitScreen>
       context: context,
       builder: (_) => AlertDialog(
         title: const Text("Initialize New Core"),
-        content: TextField(controller: c, decoration: const InputDecoration(hintText: "Enter core name")),
+        content: TextField(
+          controller: c,
+          decoration: const InputDecoration(hintText: "Enter core name"),
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
-          TextButton(onPressed: () => Navigator.pop(context, c.text), child: const Text("Create")),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Cancel"),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, c.text),
+            child: const Text("Create"),
+          ),
         ],
       ),
     );
@@ -219,10 +389,19 @@ class _OrbitScreenState extends State<OrbitScreen>
       context: context,
       builder: (_) => AlertDialog(
         title: const Text("Add Additional Core"),
-        content: TextField(controller: c, decoration: const InputDecoration(hintText: "Enter core name")),
+        content: TextField(
+          controller: c,
+          decoration: const InputDecoration(hintText: "Enter core name"),
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
-          TextButton(onPressed: () => Navigator.pop(context, c.text), child: const Text("Create")),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Cancel"),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, c.text),
+            child: const Text("Create"),
+          ),
         ],
       ),
     );
@@ -265,31 +444,113 @@ class _OrbitScreenState extends State<OrbitScreen>
     }
 
     final c = TextEditingController();
-    final name = await showDialog<String>(
+    final createdPlanet = await showDialog<({String name, Color color})>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: Text("New Planet for ${targetSun.text}"),
-        content: TextField(controller: c, decoration: const InputDecoration(hintText: "Enter planet name")),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
-          TextButton(onPressed: () => Navigator.pop(context, c.text), child: const Text("Create")),
-        ],
-      ),
+      builder: (_) {
+        var selectedColor = _planetColorOptions.first.color;
+
+        return StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            title: Text("New Planet for ${targetSun.text}"),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: c,
+                  decoration: const InputDecoration(
+                    hintText: "Enter planet name",
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  "Planet color",
+                  style: TextStyle(color: Colors.white70),
+                ),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<Color>(
+                  value: selectedColor,
+                  dropdownColor: const Color(0xFF0F1633),
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 14,
+                    ),
+                  ),
+                  items: _planetColorOptions.map((option) {
+                    return DropdownMenuItem<Color>(
+                      value: option.color,
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 14,
+                            height: 14,
+                            decoration: BoxDecoration(
+                              color: option.color,
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Text(option.label),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                  onChanged: (value) {
+                    if (value == null) return;
+                    setDialogState(() {
+                      selectedColor = value;
+                    });
+                  },
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text("Cancel"),
+              ),
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(context, (
+                    name: c.text.trim(),
+                    color: selectedColor,
+                  ));
+                },
+                child: const Text("Create"),
+              ),
+            ],
+          ),
+        );
+      },
     );
 
-    if (name == null || name.isEmpty) return;
+    if (createdPlanet == null || createdPlanet.name.isEmpty) return;
 
     setState(() {
-      final radius = 250 + random.nextDouble() * 200;
-      final angle = random.nextDouble() * pi * 2;
+      final siblingPlanets = bodies
+          .where((b) => b.parent == targetSun && b.type == BodyType.planet)
+          .toList();
+      const firstOrbitRadius = 240.0;
+      const orbitSpacing = 110.0;
+      final orbitSeed = _stableUnitFromString(
+        "${targetSun.text}-${createdPlanet.name}",
+      );
+      final radius = firstOrbitRadius + siblingPlanets.length * orbitSpacing;
+      final flattening = 0.56 + orbitSeed * 0.26;
+      final orbitTilt = -0.55 + orbitSeed * 1.1;
+      final angle = _bestPlanetStartAngle(siblingPlanets);
       final planet = Body(
-        text: name,
+        text: createdPlanet.name,
         type: BodyType.planet,
         parent: targetSun,
         orbitRadius: radius,
+        orbitHeight: radius * flattening,
+        orbitTilt: orbitTilt,
         angle: angle,
-        speed: 0.002 + random.nextDouble() * 0.003,
-        color: [Colors.blue, Colors.green, Colors.red, Colors.purple, Colors.cyan][random.nextInt(5)],
+        speed: 0.0018 + random.nextDouble() * 0.0025,
+        color: createdPlanet.color,
       );
 
       bodies.add(planet);
@@ -297,19 +558,32 @@ class _OrbitScreenState extends State<OrbitScreen>
   }
 
   Future<void> createMoon() async {
-    if (selected == null || (selected!.type != BodyType.planet && selected!.type != BodyType.moon)) return;
+    if (selected == null ||
+        (selected!.type != BodyType.planet && selected!.type != BodyType.moon))
+      return;
 
-    final parentPlanet = selected!.type == BodyType.planet ? selected! : selected!.parent!;
+    final parentPlanet = selected!.type == BodyType.planet
+        ? selected!
+        : selected!.parent!;
 
     final c = TextEditingController();
     final name = await showDialog<String>(
       context: context,
       builder: (_) => AlertDialog(
         title: const Text("New Moon"),
-        content: TextField(controller: c, decoration: const InputDecoration(hintText: "Enter moon name")),
+        content: TextField(
+          controller: c,
+          decoration: const InputDecoration(hintText: "Enter moon name"),
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
-          TextButton(onPressed: () => Navigator.pop(context, c.text), child: const Text("Create")),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Cancel"),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, c.text),
+            child: const Text("Create"),
+          ),
         ],
       ),
     );
@@ -317,7 +591,9 @@ class _OrbitScreenState extends State<OrbitScreen>
     if (name == null || name.isEmpty) return;
 
     setState(() {
-      final moons = bodies.where((b) => b.parent == parentPlanet && b.type == BodyType.moon).toList();
+      final moons = bodies
+          .where((b) => b.parent == parentPlanet && b.type == BodyType.moon)
+          .toList();
       final count = moons.length + 1;
       const radius = 80.0;
 
@@ -366,11 +642,20 @@ class _OrbitScreenState extends State<OrbitScreen>
       final maxMoonOrbit = moons
           .map((moon) => moon.orbitRadius)
           .fold<double>(0, max);
-      final usableWidth = viewportSize.width * 0.38;
-      final usableHeight = viewportSize.height * 0.28;
-      final framedRadius = maxMoonOrbit + 90;
-      final fittedZoom = min(usableWidth, usableHeight) / framedRadius;
-      return fittedZoom.clamp(0.9, 1.8);
+      final isCompact = _isCompactViewport(viewportSize);
+      final horizontalPadding = isCompact ? 48.0 : 120.0;
+      final verticalPadding = isCompact ? 220.0 : 180.0;
+      final usableWidth = max(160.0, viewportSize.width - horizontalPadding);
+      final usableHeight = max(220.0, viewportSize.height - verticalPadding);
+      final orbitDiameter = (maxMoonOrbit + 90) * 2;
+      final orbitFitZoom = min(usableWidth, usableHeight) / orbitDiameter;
+
+      final moonColumnHalfHeight =
+          ((moons.length - 1) * _moonRowSpacing(viewportSize)) / 2 + 40;
+      final columnFitZoom = usableHeight / (moonColumnHalfHeight * 2);
+      final fittedZoom = min(orbitFitZoom, columnFitZoom);
+
+      return fittedZoom.clamp(isCompact ? 0.55 : 0.8, 1.6);
     }
 
     return 1.2.clamp(_minZoom, _maxZoom);
@@ -450,10 +735,7 @@ class _OrbitScreenState extends State<OrbitScreen>
           child: InteractiveViewer(
             child: ClipRRect(
               borderRadius: BorderRadius.circular(18),
-              child: _buildAttachmentImage(
-                attachment,
-                fit: BoxFit.contain,
-              ),
+              child: _buildAttachmentImage(attachment, fit: BoxFit.contain),
             ),
           ),
         ),
@@ -510,10 +792,7 @@ class _OrbitScreenState extends State<OrbitScreen>
       height: height,
       color: Colors.white10,
       alignment: Alignment.center,
-      child: const Icon(
-        Icons.broken_image_outlined,
-        color: Colors.white24,
-      ),
+      child: const Icon(Icons.broken_image_outlined, color: Colors.white24),
     );
   }
 
@@ -565,7 +844,9 @@ class _OrbitScreenState extends State<OrbitScreen>
               return GestureDetector(
                 onTap: () => _openAttachment(attachment),
                 child: Container(
-                  width: isImage ? (isCompact ? 110 : 140) : (isCompact ? 140 : 180),
+                  width: isImage
+                      ? (isCompact ? 110 : 140)
+                      : (isCompact ? 140 : 180),
                   padding: const EdgeInsets.all(10),
                   decoration: BoxDecoration(
                     color: Colors.white.withValues(alpha: 0.04),
@@ -626,18 +907,23 @@ class _OrbitScreenState extends State<OrbitScreen>
     _setZoom(zoomTarget + delta);
   }
 
-  Body? detectBody(Offset world) {
+  Body? detectBody(Offset world, Size viewportSize) {
     for (final b in bodies.reversed) {
-      Offset hitPos = b.position;
-      if (mode == MapMode.focused && selected != null && b.parent == selected && b.type == BodyType.moon) {
-        final moons = bodies.where((m) => m.parent == selected && m.type == BodyType.moon).toList();
-        final index = moons.indexOf(b);
-        final columnX = selected!.position.dx - (220 / zoom);
-        final columnY = selected!.position.dy - (moons.length * 50) / 2 + index * 100;
-        hitPos = Offset.lerp(b.position, Offset(columnX, columnY), focusProgress)!;
-      }
+      final hitPos = _resolvedBodyPosition(
+        body: b,
+        selected: selected,
+        mode: mode,
+        bodies: bodies,
+        viewportSize: viewportSize,
+        zoomLevel: zoom,
+        focusProgress: focusProgress,
+      );
 
-      final r = (b.type == BodyType.sun ? 60 : (b.type == BodyType.planet ? 40 : 25)) / zoom;
+      final r =
+          (b.type == BodyType.sun
+              ? 60
+              : (b.type == BodyType.planet ? 40 : 25)) /
+          zoom;
       if ((hitPos - world).distance < r) {
         return b;
       }
@@ -730,14 +1016,15 @@ class _OrbitScreenState extends State<OrbitScreen>
                   }
 
                   setState(() {
-                    cameraTarget = _gestureStartCamera -
+                    cameraTarget =
+                        _gestureStartCamera -
                         (details.localFocalPoint - _gestureStartFocalPoint) /
                             zoom;
                   });
                 },
                 onTapDown: (d) {
                   final world = screenToWorld(d.localPosition, size);
-                  final b = detectBody(world);
+                  final b = detectBody(world, size);
                   if (b != null) {
                     if (b.type == BodyType.moon) {
                       openPanel(b);
@@ -747,10 +1034,14 @@ class _OrbitScreenState extends State<OrbitScreen>
                   } else {
                     if (bodies.isNotEmpty) {
                       // Click empty space -> navigate back to nearest sun or current selected sun
-                      Body? root = bodies.firstWhere((b) => b.type == BodyType.sun);
+                      Body? root = bodies.firstWhere(
+                        (b) => b.type == BodyType.sun,
+                      );
                       if (selected != null) {
                         Body? p = selected;
-                        while(p != null && p.type != BodyType.sun) { p = p.parent; }
+                        while (p != null && p.type != BodyType.sun) {
+                          p = p.parent;
+                        }
                         if (p != null) root = p;
                       }
                       selected = root;
@@ -762,7 +1053,15 @@ class _OrbitScreenState extends State<OrbitScreen>
                   }
                 },
                 child: CustomPaint(
-                  painter: OrbitPainter(bodies, camera, zoom, selected, mode, focusProgress),
+                  painter: OrbitPainter(
+                    bodies,
+                    camera,
+                    zoom,
+                    selected,
+                    mode,
+                    focusProgress,
+                    size,
+                  ),
                   child: Container(),
                 ),
               ),
@@ -775,14 +1074,24 @@ class _OrbitScreenState extends State<OrbitScreen>
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text("NO SYSTEM FOUND", style: TextStyle(letterSpacing: 6, color: Colors.white24, fontSize: 18)),
+                  const Text(
+                    "NO SYSTEM FOUND",
+                    style: TextStyle(
+                      letterSpacing: 6,
+                      color: Colors.white24,
+                      fontSize: 18,
+                    ),
+                  ),
                   const SizedBox(height: 24),
                   ElevatedButton.icon(
                     onPressed: createSubject,
                     icon: const Icon(Icons.auto_awesome),
                     label: const Text("INITIALIZE CORE"),
                     style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 16,
+                      ),
                       backgroundColor: Colors.white.withValues(alpha: 0.05),
                       side: const BorderSide(color: Colors.white12),
                     ),
@@ -808,7 +1117,9 @@ class _OrbitScreenState extends State<OrbitScreen>
                         bool isActive = false;
                         if (selected != null) {
                           Body? p = selected;
-                          while(p != null && p.type != BodyType.sun) { p = p.parent; }
+                          while (p != null && p.type != BodyType.sun) {
+                            p = p.parent;
+                          }
                           if (p == sun) isActive = true;
                         }
                         return GestureDetector(
@@ -823,19 +1134,32 @@ class _OrbitScreenState extends State<OrbitScreen>
                           },
                           child: Container(
                             margin: const EdgeInsets.symmetric(horizontal: 8),
-                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 8,
+                            ),
                             decoration: BoxDecoration(
-                              color: isActive ? Colors.white.withValues(alpha: 0.1) : Colors.black45,
+                              color: isActive
+                                  ? Colors.white.withValues(alpha: 0.1)
+                                  : Colors.black45,
                               borderRadius: BorderRadius.circular(20),
-                              border: Border.all(color: isActive ? Colors.cyanAccent : Colors.white12),
+                              border: Border.all(
+                                color: isActive
+                                    ? Colors.cyanAccent
+                                    : Colors.white12,
+                              ),
                             ),
                             child: Text(
                               sun.text.toUpperCase(),
                               style: TextStyle(
                                 fontSize: 12,
                                 letterSpacing: 2,
-                                color: isActive ? Colors.cyanAccent : Colors.white60,
-                                fontWeight: isActive ? FontWeight.bold : FontWeight.normal,
+                                color: isActive
+                                    ? Colors.cyanAccent
+                                    : Colors.white60,
+                                fontWeight: isActive
+                                    ? FontWeight.bold
+                                    : FontWeight.normal,
                               ),
                             ),
                           ),
@@ -865,8 +1189,9 @@ class _OrbitScreenState extends State<OrbitScreen>
                       Navigator.push(
                         context,
                         MaterialPageRoute(
-                          builder: (context) =>
-                              ProgressTrackerPage(bodies: List<Body>.from(bodies)),
+                          builder: (context) => ProgressTrackerPage(
+                            bodies: List<Body>.from(bodies),
+                          ),
                         ),
                       );
                     }, "TRACKER"),
@@ -877,7 +1202,7 @@ class _OrbitScreenState extends State<OrbitScreen>
                           builder: (context) => JournalPage(journal: journal),
                         ),
                       );
-                    }, "JOURNAL"),
+                    }, "TO-DO"),
                   ],
                 ),
               ),
@@ -899,7 +1224,12 @@ class _OrbitScreenState extends State<OrbitScreen>
                             letterSpacing: isCompact ? 3 : 6,
                             fontWeight: FontWeight.w200,
                             color: Colors.white,
-                            shadows: [Shadow(color: selected!.color.withValues(alpha: 0.5), blurRadius: 20)],
+                            shadows: [
+                              Shadow(
+                                color: selected!.color.withValues(alpha: 0.5),
+                                blurRadius: 20,
+                              ),
+                            ],
                           ),
                         ),
                         const SizedBox(height: 12),
@@ -908,7 +1238,11 @@ class _OrbitScreenState extends State<OrbitScreen>
                           height: 1,
                           decoration: const BoxDecoration(
                             gradient: LinearGradient(
-                              colors: [Colors.transparent, Colors.white24, Colors.transparent],
+                              colors: [
+                                Colors.transparent,
+                                Colors.white24,
+                                Colors.transparent,
+                              ],
                             ),
                           ),
                         ),
@@ -935,7 +1269,7 @@ class _OrbitScreenState extends State<OrbitScreen>
             // SIDE PANEL
             if (showPanel && panelBody != null)
               _buildSidePanel(size, isCompact),
-          ]
+          ],
         ],
       ),
     );
@@ -956,7 +1290,14 @@ class _OrbitScreenState extends State<OrbitScreen>
             ),
           ),
           const SizedBox(width: 12),
-          Text(label, style: const TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white38)),
+          Text(
+            label,
+            style: const TextStyle(
+              fontSize: 10,
+              letterSpacing: 2,
+              color: Colors.white38,
+            ),
+          ),
         ],
       ),
     );
@@ -1009,11 +1350,12 @@ class _OrbitScreenState extends State<OrbitScreen>
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (context) => ProgressTrackerPage(bodies: List<Body>.from(bodies)),
+            builder: (context) =>
+                ProgressTrackerPage(bodies: List<Body>.from(bodies)),
           ),
         );
       }),
-      _compactActionBtn(Icons.book, "Journal", () {
+      _compactActionBtn(Icons.book, "To-Do", () {
         Navigator.push(
           context,
           MaterialPageRoute(
@@ -1031,7 +1373,10 @@ class _OrbitScreenState extends State<OrbitScreen>
           borderRadius: BorderRadius.circular(24),
           border: Border.all(color: Colors.white12),
           boxShadow: [
-            BoxShadow(color: Colors.black.withValues(alpha: 0.25), blurRadius: 18),
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.25),
+              blurRadius: 18,
+            ),
           ],
         ),
         child: Padding(
@@ -1072,7 +1417,12 @@ class _OrbitScreenState extends State<OrbitScreen>
           color: const Color(0xFF0F1633).withValues(alpha: 0.98),
           border: Border.all(color: Colors.white24, width: 2),
           borderRadius: isCompact ? BorderRadius.circular(18) : null,
-          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 40)],
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.5),
+              blurRadius: 40,
+            ),
+          ],
         ),
         child: Column(
           children: [
@@ -1080,7 +1430,9 @@ class _OrbitScreenState extends State<OrbitScreen>
             Container(
               height: 60,
               decoration: const BoxDecoration(
-                border: Border(bottom: BorderSide(color: Colors.white24, width: 2)),
+                border: Border(
+                  bottom: BorderSide(color: Colors.white24, width: 2),
+                ),
               ),
               child: IntrinsicHeight(
                 child: Row(
@@ -1094,46 +1446,74 @@ class _OrbitScreenState extends State<OrbitScreen>
                             Expanded(
                               child: Text(
                                 panelBody!.text,
-                                style: const TextStyle(fontSize: 22, color: Colors.white, fontWeight: FontWeight.w300),
+                                style: const TextStyle(
+                                  fontSize: 22,
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w300,
+                                ),
                                 overflow: TextOverflow.ellipsis,
                               ),
                             ),
                             IconButton(
                               onPressed: () {
                                 setState(() {
-                                  panelBody!.isCompleted = !panelBody!.isCompleted;
+                                  panelBody!.isCompleted =
+                                      !panelBody!.isCompleted;
                                 });
                               },
                               icon: Icon(
-                                panelBody!.isCompleted ? Icons.check_circle : Icons.radio_button_unchecked,
-                                color: panelBody!.isCompleted ? Colors.cyanAccent : Colors.white24,
+                                panelBody!.isCompleted
+                                    ? Icons.check_circle
+                                    : Icons.radio_button_unchecked,
+                                color: panelBody!.isCompleted
+                                    ? Colors.cyanAccent
+                                    : Colors.white24,
                               ),
-                            )
+                            ),
                           ],
                         ),
                       ),
                     ),
-                    const VerticalDivider(color: Colors.white38, width: 1, thickness: 1.5),
+                    const VerticalDivider(
+                      color: Colors.white38,
+                      width: 1,
+                      thickness: 1.5,
+                    ),
                     Expanded(
                       child: InkWell(
                         onTap: () => setState(() => isEditMode = true),
                         child: const Center(
-                          child: Icon(Icons.edit, color: Colors.white60, size: 20),
+                          child: Icon(
+                            Icons.edit,
+                            color: Colors.white60,
+                            size: 20,
+                          ),
                         ),
                       ),
                     ),
-                    const VerticalDivider(color: Colors.white38, width: 1, thickness: 1.5),
+                    const VerticalDivider(
+                      color: Colors.white38,
+                      width: 1,
+                      thickness: 1.5,
+                    ),
                     Expanded(
                       child: InkWell(
                         onTap: () {
                           setState(() {
                             bodies.remove(panelBody);
                             showPanel = false;
-                            if (selected == panelBody) selected = bodies.isNotEmpty ? bodies.first : null;
+                            if (selected == panelBody)
+                              selected = bodies.isNotEmpty
+                                  ? bodies.first
+                                  : null;
                           });
                         },
                         child: const Center(
-                          child: Icon(Icons.delete, color: Colors.redAccent, size: 20),
+                          child: Icon(
+                            Icons.delete,
+                            color: Colors.redAccent,
+                            size: 20,
+                          ),
                         ),
                       ),
                     ),
@@ -1192,7 +1572,9 @@ class _OrbitScreenState extends State<OrbitScreen>
             Container(
               height: 60,
               decoration: const BoxDecoration(
-                border: Border(top: BorderSide(color: Colors.white24, width: 2)),
+                border: Border(
+                  top: BorderSide(color: Colors.white24, width: 2),
+                ),
               ),
               child: IntrinsicHeight(
                 child: Row(
@@ -1201,12 +1583,22 @@ class _OrbitScreenState extends State<OrbitScreen>
                       child: InkWell(
                         onTap: () => setState(() => showPanel = false),
                         child: const Center(
-                          child: Text("close", style: TextStyle(fontSize: 18, color: Colors.white60)),
+                          child: Text(
+                            "close",
+                            style: TextStyle(
+                              fontSize: 18,
+                              color: Colors.white60,
+                            ),
+                          ),
                         ),
                       ),
                     ),
                     if (isEditMode) ...[
-                      const VerticalDivider(color: Colors.white38, width: 1, thickness: 1.5),
+                      const VerticalDivider(
+                        color: Colors.white38,
+                        width: 1,
+                        thickness: 1.5,
+                      ),
                       Expanded(
                         child: InkWell(
                           onTap: () {
@@ -1216,7 +1608,13 @@ class _OrbitScreenState extends State<OrbitScreen>
                             });
                           },
                           child: const Center(
-                            child: Text("save", style: TextStyle(fontSize: 18, color: Colors.white60)),
+                            child: Text(
+                              "save",
+                              style: TextStyle(
+                                fontSize: 18,
+                                color: Colors.white60,
+                              ),
+                            ),
                           ),
                         ),
                       ),
@@ -1253,17 +1651,22 @@ class _ProgressTrackerPageState extends State<ProgressTrackerPage> {
 
   @override
   Widget build(BuildContext context) {
-    if (suns.isEmpty) return const Scaffold(body: Center(child: Text("No Cores")));
+    if (suns.isEmpty)
+      return const Scaffold(body: Center(child: Text("No Cores")));
 
     final size = MediaQuery.of(context).size;
     final isCompact = min(size.width, size.height) < 700;
     final currentSun = suns[_currentSunIndex];
-    final planets = widget.bodies.where((b) => b.parent == currentSun && b.type == BodyType.planet).toList();
+    final planets = widget.bodies
+        .where((b) => b.parent == currentSun && b.type == BodyType.planet)
+        .toList();
 
     final moons = widget.bodies.where((b) {
       if (b.type != BodyType.moon) return false;
       Body? p = b.parent;
-      while(p != null && p.type != BodyType.sun) { p = p.parent; }
+      while (p != null && p.type != BodyType.sun) {
+        p = p.parent;
+      }
       return p == currentSun;
     }).toList();
 
@@ -1317,13 +1720,31 @@ class _ProgressTrackerPageState extends State<ProgressTrackerPage> {
                             }),
                             child: Container(
                               margin: const EdgeInsets.symmetric(horizontal: 8),
-                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-                              decoration: BoxDecoration(
-                                border: Border.all(color: isSel ? Colors.cyanAccent : Colors.white12),
-                                borderRadius: BorderRadius.circular(15),
-                                color: isSel ? Colors.cyanAccent.withValues(alpha: 0.1) : Colors.black26,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 6,
                               ),
-                              child: Text(s.text.toUpperCase(), style: TextStyle(fontSize: 10, letterSpacing: 1, color: isSel ? Colors.cyanAccent : Colors.white38)),
+                              decoration: BoxDecoration(
+                                border: Border.all(
+                                  color: isSel
+                                      ? Colors.cyanAccent
+                                      : Colors.white12,
+                                ),
+                                borderRadius: BorderRadius.circular(15),
+                                color: isSel
+                                    ? Colors.cyanAccent.withValues(alpha: 0.1)
+                                    : Colors.black26,
+                              ),
+                              child: Text(
+                                s.text.toUpperCase(),
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  letterSpacing: 1,
+                                  color: isSel
+                                      ? Colors.cyanAccent
+                                      : Colors.white38,
+                                ),
+                              ),
                             ),
                           );
                         }).toList(),
@@ -1355,33 +1776,57 @@ class _ProgressTrackerPageState extends State<ProgressTrackerPage> {
             right: 0,
             child: Column(
               children: [
-                if (planets.isNotEmpty && _selectedPlanetIndex < planets.length) ...[
-                  Builder(builder: (context) {
-                    final selectedPlanet = planets[_selectedPlanetIndex];
-                    final pMoons = widget.bodies.where((b) => b.parent == selectedPlanet && b.type == BodyType.moon).toList();
-                    final level = pMoons.isEmpty ? 15 : (pMoons.where((m) => m.isCompleted).length / pMoons.length * 85 + 15).toInt();
-                    return Text("${selectedPlanet.text.toUpperCase()} $level",
-                        style: TextStyle(fontSize: isCompact ? 16 : 22, letterSpacing: isCompact ? 2 : 4, color: Colors.white, fontWeight: FontWeight.w300));
-                  }),
+                if (planets.isNotEmpty &&
+                    _selectedPlanetIndex < planets.length) ...[
+                  Builder(
+                    builder: (context) {
+                      final selectedPlanet = planets[_selectedPlanetIndex];
+                      final pMoons = widget.bodies
+                          .where(
+                            (b) =>
+                                b.parent == selectedPlanet &&
+                                b.type == BodyType.moon,
+                          )
+                          .toList();
+                      final level = pMoons.isEmpty
+                          ? 15
+                          : (pMoons.where((m) => m.isCompleted).length /
+                                        pMoons.length *
+                                        85 +
+                                    15)
+                                .toInt();
+                      return Text(
+                        "${selectedPlanet.text.toUpperCase()} $level",
+                        style: TextStyle(
+                          fontSize: isCompact ? 16 : 22,
+                          letterSpacing: isCompact ? 2 : 4,
+                          color: Colors.white,
+                          fontWeight: FontWeight.w300,
+                        ),
+                      );
+                    },
+                  ),
                   const SizedBox(height: 8),
                   Container(width: 150, height: 2, color: Colors.white30),
                   const SizedBox(height: 16),
                 ],
-                Text(currentSun.text.toUpperCase(),
-                    textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: isCompact ? 34 : 64, letterSpacing: isCompact ? 5 : 12, fontWeight: FontWeight.w100, color: Colors.white)),
+                Text(
+                  currentSun.text.toUpperCase(),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: isCompact ? 34 : 64,
+                    letterSpacing: isCompact ? 5 : 12,
+                    fontWeight: FontWeight.w100,
+                    color: Colors.white,
+                  ),
+                ),
                 const SizedBox(height: 8),
                 Container(width: 200, height: 2, color: Colors.white30),
               ],
             ),
           ),
 
-          Positioned(
-            bottom: 30,
-            left: 0,
-            right: 0,
-            child: _buildBottomBars(),
-          ),
+          Positioned(bottom: 30, left: 0, right: 0, child: _buildBottomBars()),
 
           Positioned(
             top: 20,
@@ -1401,19 +1846,34 @@ class _ProgressTrackerPageState extends State<ProgressTrackerPage> {
     final isCompact = min(size.width, size.height) < 700;
     return Column(
       children: [
-        Text("PROGRESS", style: TextStyle(fontSize: isCompact ? 16 : 20, letterSpacing: isCompact ? 3 : 4, fontWeight: FontWeight.w300)),
+        Text(
+          "PROGRESS",
+          style: TextStyle(
+            fontSize: isCompact ? 16 : 20,
+            letterSpacing: isCompact ? 3 : 4,
+            fontWeight: FontWeight.w300,
+          ),
+        ),
         const SizedBox(height: 10),
         Container(
           width: min(size.width * 0.72, 300.0),
           height: 4,
-          decoration: BoxDecoration(color: Colors.white10, border: Border.all(color: Colors.white24, width: 0.5)),
+          decoration: BoxDecoration(
+            color: Colors.white10,
+            border: Border.all(color: Colors.white24, width: 0.5),
+          ),
           child: FractionallySizedBox(
             alignment: Alignment.centerLeft,
             widthFactor: progress.clamp(0.0, 1.0),
             child: Container(
               decoration: BoxDecoration(
                 color: Colors.cyanAccent,
-                boxShadow: [BoxShadow(color: Colors.cyanAccent.withValues(alpha: 0.5), blurRadius: 8)],
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.cyanAccent.withValues(alpha: 0.5),
+                    blurRadius: 8,
+                  ),
+                ],
               ),
             ),
           ),
@@ -1425,8 +1885,14 @@ class _ProgressTrackerPageState extends State<ProgressTrackerPage> {
             border: Border.all(color: Colors.white12),
             color: Colors.black26,
           ),
-          child: Text("Topics to complete: ${total - completed}",
-              style: const TextStyle(fontSize: 13, letterSpacing: 2, color: Colors.white60)),
+          child: Text(
+            "Topics to complete: ${total - completed}",
+            style: const TextStyle(
+              fontSize: 13,
+              letterSpacing: 2,
+              color: Colors.white60,
+            ),
+          ),
         ),
       ],
     );
@@ -1451,12 +1917,23 @@ class _ProgressTrackerPageState extends State<ProgressTrackerPage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1)),
+        Text(
+          label,
+          style: TextStyle(
+            color: color,
+            fontSize: 10,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 1,
+          ),
+        ),
         const SizedBox(height: 4),
         Container(
           width: isCompact ? 110 : 200,
           height: 8,
-          decoration: BoxDecoration(color: Colors.black45, border: Border.all(color: Colors.white10)),
+          decoration: BoxDecoration(
+            color: Colors.black45,
+            border: Border.all(color: Colors.white10),
+          ),
           child: FractionallySizedBox(
             alignment: Alignment.centerLeft,
             widthFactor: val,
@@ -1488,7 +1965,9 @@ class GlobalTreePainter extends CustomPainter {
     final centerY = size.height - 250;
     final sunPos = Offset(centerX, centerY);
 
-    final planets = bodies.where((b) => b.parent == sun && b.type == BodyType.planet).toList();
+    final planets = bodies
+        .where((b) => b.parent == sun && b.type == BodyType.planet)
+        .toList();
     if (planets.isEmpty) return;
 
     double baseScale = min(size.width / 800, size.height / 800).clamp(0.5, 1.0);
@@ -1504,7 +1983,9 @@ class GlobalTreePainter extends CustomPainter {
           : -pi / 2;
 
       double planetDist = (isSelected ? 180.0 : 150.0) * baseScale;
-      final planetPos = sunPos + Offset(cos(planetAngle) * planetDist, sin(planetAngle) * planetDist);
+      final planetPos =
+          sunPos +
+          Offset(cos(planetAngle) * planetDist, sin(planetAngle) * planetDist);
 
       final linePaint = Paint()
         ..color = planet.color.withValues(alpha: isSelected ? 0.4 : 0.1)
@@ -1512,42 +1993,90 @@ class GlobalTreePainter extends CustomPainter {
 
       canvas.drawLine(sunPos, planetPos, linePaint);
 
-      final moons = bodies.where((b) => b.parent == planet && b.type == BodyType.moon).toList();
+      final moons = bodies
+          .where((b) => b.parent == planet && b.type == BodyType.moon)
+          .toList();
 
       for (int j = 0; j < moons.length; j++) {
         final moon = moons[j];
         double moonSpread = pi * 0.3;
-        double moonAngle = planetAngle + (moons.length > 1
-            ? (j / (moons.length - 1) - 0.5) * moonSpread
-            : 0);
+        double moonAngle =
+            planetAngle +
+            (moons.length > 1
+                ? (j / (moons.length - 1) - 0.5) * moonSpread
+                : 0);
         double moonDist = (isSelected ? 80.0 : 60.0) * baseScale;
-        final moonPos = planetPos + Offset(cos(moonAngle) * moonDist, sin(moonAngle) * moonDist);
+        final moonPos =
+            planetPos +
+            Offset(cos(moonAngle) * moonDist, sin(moonAngle) * moonDist);
 
         // Connect Planet to Moon ONLY
-        canvas.drawLine(planetPos, moonPos, linePaint..color = planet.color.withValues(alpha: isSelected ? 0.3 : 0.1));
+        canvas.drawLine(
+          planetPos,
+          moonPos,
+          linePaint
+            ..color = planet.color.withValues(alpha: isSelected ? 0.3 : 0.1),
+        );
 
         final starColor = moon.isCompleted ? Colors.white : Colors.white24;
         if (moon.isCompleted) {
-          canvas.drawCircle(moonPos, 10 * baseScale, Paint()..color = planet.color.withValues(alpha: 0.2)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6));
+          canvas.drawCircle(
+            moonPos,
+            10 * baseScale,
+            Paint()
+              ..color = planet.color.withValues(alpha: 0.2)
+              ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6),
+          );
         }
-        canvas.drawCircle(moonPos, (isSelected ? 4 : 2) * baseScale, Paint()..color = starColor);
+        canvas.drawCircle(
+          moonPos,
+          (isSelected ? 4 : 2) * baseScale,
+          Paint()..color = starColor,
+        );
 
         if (isSelected) {
           final tp = TextPainter(
-            text: TextSpan(text: moon.text.toUpperCase(), style: TextStyle(color: starColor, fontSize: 9 * baseScale, letterSpacing: 1)),
+            text: TextSpan(
+              text: moon.text.toUpperCase(),
+              style: TextStyle(
+                color: starColor,
+                fontSize: 9 * baseScale,
+                letterSpacing: 1,
+              ),
+            ),
             textDirection: TextDirection.ltr,
           )..layout();
           tp.paint(canvas, moonPos + Offset(-tp.width / 2, 10 * baseScale));
         }
       }
 
-      canvas.drawCircle(planetPos, (isSelected ? 8 : 5) * baseScale, Paint()..color = planet.color..maskFilter = MaskFilter.blur(BlurStyle.normal, isSelected ? 10 : 5));
-      canvas.drawCircle(planetPos, (isSelected ? 4 : 2) * baseScale, Paint()..color = Colors.white);
+      canvas.drawCircle(
+        planetPos,
+        (isSelected ? 8 : 5) * baseScale,
+        Paint()
+          ..color = planet.color
+          ..maskFilter = MaskFilter.blur(BlurStyle.normal, isSelected ? 10 : 5),
+      );
+      canvas.drawCircle(
+        planetPos,
+        (isSelected ? 4 : 2) * baseScale,
+        Paint()..color = Colors.white,
+      );
     }
 
     // Core Node
-    canvas.drawCircle(sunPos, 15 * baseScale, Paint()..color = Colors.orangeAccent.withValues(alpha: 0.2)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 15));
-    canvas.drawCircle(sunPos, 8 * baseScale, Paint()..color = Colors.orangeAccent);
+    canvas.drawCircle(
+      sunPos,
+      15 * baseScale,
+      Paint()
+        ..color = Colors.orangeAccent.withValues(alpha: 0.2)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 15),
+    );
+    canvas.drawCircle(
+      sunPos,
+      8 * baseScale,
+      Paint()..color = Colors.orangeAccent,
+    );
   }
 
   @override
@@ -1667,7 +2196,14 @@ class _JournalPageState extends State<JournalPage> {
               ),
               child: Column(
                 children: [
-                  Text("JOURNAL", style: TextStyle(fontSize: isCompact ? 22 : 28, letterSpacing: isCompact ? 4 : 8, fontWeight: FontWeight.w200)),
+                  Text(
+                    "TO-DO LIST",
+                    style: TextStyle(
+                      fontSize: isCompact ? 22 : 28,
+                      letterSpacing: isCompact ? 4 : 8,
+                      fontWeight: FontWeight.w200,
+                    ),
+                  ),
                   const Divider(color: Colors.white24, height: 40),
                   Row(
                     children: [
@@ -1712,28 +2248,47 @@ class _JournalPageState extends State<JournalPage> {
                           title: Text(
                             item.task,
                             style: TextStyle(
-                              color: item.isDone ? Colors.white24 : Colors.white70,
-                              decoration: item.isDone ? TextDecoration.lineThrough : null,
+                              color: item.isDone
+                                  ? Colors.white24
+                                  : Colors.white70,
+                              decoration: item.isDone
+                                  ? TextDecoration.lineThrough
+                                  : null,
                             ),
                           ),
                           subtitle: item.deadline != null
-                              ? Text("Deadline: ${_formatDeadline(item.deadline!)}",
-                              style: const TextStyle(color: Colors.cyanAccent, fontSize: 12))
+                              ? Text(
+                                  "Deadline: ${_formatDeadline(item.deadline!)}",
+                                  style: const TextStyle(
+                                    color: Colors.cyanAccent,
+                                    fontSize: 12,
+                                  ),
+                                )
                               : null,
                           trailing: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               IconButton(
                                 icon: Icon(
-                                  item.deadline != null ? Icons.alarm_on : Icons.alarm_add,
-                                  color: item.deadline != null ? Colors.cyanAccent : Colors.white24,
+                                  item.deadline != null
+                                      ? Icons.alarm_on
+                                      : Icons.alarm_add,
+                                  color: item.deadline != null
+                                      ? Colors.cyanAccent
+                                      : Colors.white24,
                                   size: 20,
                                 ),
                                 onPressed: () => _setDeadline(item),
                               ),
                               IconButton(
-                                icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 20),
-                                onPressed: () => setState(() => widget.journal.removeAt(index)),
+                                icon: const Icon(
+                                  Icons.delete_outline,
+                                  color: Colors.redAccent,
+                                  size: 20,
+                                ),
+                                onPressed: () => setState(
+                                  () => widget.journal.removeAt(index),
+                                ),
                               ),
                             ],
                           ),
@@ -1749,7 +2304,10 @@ class _JournalPageState extends State<JournalPage> {
                       Expanded(
                         child: Container(
                           height: 6,
-                          decoration: BoxDecoration(color: Colors.white10, borderRadius: BorderRadius.circular(3)),
+                          decoration: BoxDecoration(
+                            color: Colors.white10,
+                            borderRadius: BorderRadius.circular(3),
+                          ),
                           child: FractionallySizedBox(
                             alignment: Alignment.centerLeft,
                             widthFactor: progress,
@@ -1757,14 +2315,28 @@ class _JournalPageState extends State<JournalPage> {
                               decoration: BoxDecoration(
                                 color: Colors.cyanAccent,
                                 borderRadius: BorderRadius.circular(3),
-                                boxShadow: [BoxShadow(color: Colors.cyanAccent.withValues(alpha: 0.5), blurRadius: 8)],
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.cyanAccent.withValues(
+                                      alpha: 0.5,
+                                    ),
+                                    blurRadius: 8,
+                                  ),
+                                ],
                               ),
                             ),
                           ),
                         ),
                       ),
                       const SizedBox(width: 15),
-                      Text("${(progress * 100).toInt()}%", style: const TextStyle(fontSize: 14, color: Colors.cyanAccent, fontWeight: FontWeight.bold)),
+                      Text(
+                        "${(progress * 100).toInt()}%",
+                        style: const TextStyle(
+                          fontSize: 14,
+                          color: Colors.cyanAccent,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
                     ],
                   ),
                 ],
@@ -1792,8 +2364,16 @@ class SkyrimBackground extends StatelessWidget {
       ),
       child: Stack(
         children: [
-          _nebula(Colors.indigo.withValues(alpha: 0.1), const Offset(-0.3, -0.2), 400),
-          _nebula(Colors.teal.withValues(alpha: 0.1), const Offset(0.4, 0.5), 500),
+          _nebula(
+            Colors.indigo.withValues(alpha: 0.1),
+            const Offset(-0.3, -0.2),
+            400,
+          ),
+          _nebula(
+            Colors.teal.withValues(alpha: 0.1),
+            const Offset(0.4, 0.5),
+            500,
+          ),
           CustomPaint(painter: StarPainter(), child: Container()),
         ],
       ),
@@ -1820,10 +2400,19 @@ class StarPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final random = Random(123);
     for (int i = 0; i < 300; i++) {
-      final pos = Offset(random.nextDouble() * size.width, random.nextDouble() * size.height);
-      canvas.drawCircle(pos, random.nextDouble() * 1.5, Paint()..color = Colors.white.withValues(alpha: random.nextDouble() * 0.4));
+      final pos = Offset(
+        random.nextDouble() * size.width,
+        random.nextDouble() * size.height,
+      );
+      canvas.drawCircle(
+        pos,
+        random.nextDouble() * 1.5,
+        Paint()
+          ..color = Colors.white.withValues(alpha: random.nextDouble() * 0.4),
+      );
     }
   }
+
   @override
   bool shouldRepaint(CustomPainter oldDelegate) => false;
 }
@@ -1835,8 +2424,17 @@ class OrbitPainter extends CustomPainter {
   final Body? selected;
   final MapMode mode;
   final double focusProgress;
+  final Size viewportSize;
 
-  OrbitPainter(this.bodies, this.camera, this.zoom, this.selected, this.mode, this.focusProgress);
+  OrbitPainter(
+    this.bodies,
+    this.camera,
+    this.zoom,
+    this.selected,
+    this.mode,
+    this.focusProgress,
+    this.viewportSize,
+  );
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1851,14 +2449,30 @@ class OrbitPainter extends CustomPainter {
 
     final random = Random(42);
     for (int i = 0; i < 200; i++) {
-      final starPos = Offset(random.nextDouble() * size.width, random.nextDouble() * size.height);
+      final starPos = Offset(
+        random.nextDouble() * size.width,
+        random.nextDouble() * size.height,
+      );
       final alpha = random.nextDouble() * 0.4 + 0.1;
-      canvas.drawCircle(starPos, random.nextDouble() * 1.5, Paint()..color = Colors.white.withOpacity(alpha));
+      canvas.drawCircle(
+        starPos,
+        random.nextDouble() * 1.5,
+        Paint()..color = Colors.white.withOpacity(alpha),
+      );
     }
 
-    final nebulaPaint = Paint()..maskFilter = const MaskFilter.blur(BlurStyle.normal, 80);
-    canvas.drawCircle(Offset(size.width * 0.2, size.height * 0.3), 250, nebulaPaint..color = Colors.indigo.withValues(alpha: 0.05));
-    canvas.drawCircle(Offset(size.width * 0.8, size.height * 0.7), 300, nebulaPaint..color = Colors.blueGrey.withValues(alpha: 0.05));
+    final nebulaPaint = Paint()
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 80);
+    canvas.drawCircle(
+      Offset(size.width * 0.2, size.height * 0.3),
+      250,
+      nebulaPaint..color = Colors.indigo.withValues(alpha: 0.05),
+    );
+    canvas.drawCircle(
+      Offset(size.width * 0.8, size.height * 0.7),
+      300,
+      nebulaPaint..color = Colors.blueGrey.withValues(alpha: 0.05),
+    );
 
     if (bodies.isEmpty) return;
 
@@ -1869,40 +2483,70 @@ class OrbitPainter extends CustomPainter {
 
     for (final b in bodies) {
       if (b.type == BodyType.planet && b.parent != null) {
-        canvas.drawCircle(b.parent!.position, b.orbitRadius, Paint()..style = PaintingStyle.stroke..color = Colors.white.withValues(alpha: 0.03)..strokeWidth = 1.0 / zoom);
+        canvas.save();
+        canvas.translate(b.parent!.position.dx, b.parent!.position.dy);
+        canvas.rotate(b.orbitTilt);
+        canvas.drawOval(
+          Rect.fromCenter(
+            center: Offset.zero,
+            width: b.orbitRadius * 2,
+            height: b.orbitHeight * 2,
+          ),
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..color = Colors.white.withValues(alpha: 0.03)
+            ..strokeWidth = 1.0 / zoom,
+        );
+        canvas.restore();
       }
 
       if (b.parent != null) {
         Offset start = b.parent!.position;
-        Offset end = b.position;
+        Offset end = _resolvedBodyPosition(
+          body: b,
+          selected: selected,
+          mode: mode,
+          bodies: bodies,
+          viewportSize: viewportSize,
+          zoomLevel: zoom,
+          focusProgress: focusProgress,
+        );
 
-        if (mode == MapMode.focused && selected != null && b.parent == selected && b.type == BodyType.moon) {
-          final moons = bodies.where((m) => m.parent == selected && m.type == BodyType.moon).toList();
-          final index = moons.indexOf(b);
-          final columnX = selected!.position.dx - (220 / zoom);
-          final columnY = selected!.position.dy - (moons.length * 50) / 2 + index * 100;
-          end = Offset.lerp(b.position, Offset(columnX, columnY), focusProgress)!;
-        }
-
-        final linePaint = Paint()..style = PaintingStyle.stroke..strokeWidth = (b == selected ? 2.0 : 0.5) / zoom..color = (b == selected || b.isCompleted ? b.color : Colors.white).withValues(alpha: 0.1);
+        final linePaint = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = (b == selected ? 2.0 : 0.5) / zoom
+          ..color = (b == selected || b.isCompleted ? b.color : Colors.white)
+              .withValues(alpha: 0.1);
         canvas.drawLine(start, end, linePaint);
       }
     }
 
     for (final b in bodies) {
-      Offset drawPos = b.position;
-      if (mode == MapMode.focused && selected != null && b.parent == selected && b.type == BodyType.moon) {
-        final moons = bodies.where((m) => m.parent == selected && m.type == BodyType.moon).toList();
-        final index = moons.indexOf(b);
-        final columnX = selected!.position.dx - (220 / zoom);
-        final columnY = selected!.position.dy - (moons.length * 50) / 2 + index * 100;
-        drawPos = Offset.lerp(b.position, Offset(columnX, columnY), focusProgress)!;
-      }
+      final drawPos = _resolvedBodyPosition(
+        body: b,
+        selected: selected,
+        mode: mode,
+        bodies: bodies,
+        viewportSize: viewportSize,
+        zoomLevel: zoom,
+        focusProgress: focusProgress,
+      );
 
       switch (b.type) {
-        case BodyType.sun: _drawSun(canvas, drawPos); break;
-        case BodyType.planet: _drawPlanet(canvas, drawPos, b.color, b == selected || b.isCompleted); break;
-        case BodyType.moon: _drawMoon(canvas, drawPos, b == selected || b.isCompleted, b.isCompleted); break;
+        case BodyType.sun:
+          _drawSun(canvas, drawPos);
+          break;
+        case BodyType.planet:
+          _drawPlanet(canvas, drawPos, b.color, b == selected || b.isCompleted);
+          break;
+        case BodyType.moon:
+          _drawMoon(
+            canvas,
+            drawPos,
+            b == selected || b.isCompleted,
+            b.isCompleted,
+          );
+          break;
       }
 
       if (zoom > 0.4) {
@@ -1919,7 +2563,11 @@ class OrbitPainter extends CustomPainter {
           ),
           textDirection: TextDirection.ltr,
         )..layout();
-        tp.paint(canvas, drawPos + Offset(-tp.width / 2, (b.type == BodyType.sun ? 50 : 30) / zoom));
+        tp.paint(
+          canvas,
+          drawPos +
+              Offset(-tp.width / 2, (b.type == BodyType.sun ? 50 : 30) / zoom),
+        );
       }
     }
 
@@ -1927,24 +2575,99 @@ class OrbitPainter extends CustomPainter {
   }
 
   void _drawSun(Canvas canvas, Offset pos) {
-    canvas.drawCircle(pos, 50, Paint()..color = Colors.orangeAccent.withValues(alpha: 0.3)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 30));
-    canvas.drawCircle(pos, 45, Paint()..shader = RadialGradient(colors: [Colors.white, Colors.yellow, Colors.orange, Colors.transparent], stops: const [0.0, 0.3, 0.7, 1.0]).createShader(Rect.fromCircle(center: pos, radius: 45)));
+    canvas.drawCircle(
+      pos,
+      50,
+      Paint()
+        ..color = Colors.orangeAccent.withValues(alpha: 0.3)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 30),
+    );
+    canvas.drawCircle(
+      pos,
+      45,
+      Paint()
+        ..shader = RadialGradient(
+          colors: [
+            Colors.white,
+            Colors.yellow,
+            Colors.orange,
+            Colors.transparent,
+          ],
+          stops: const [0.0, 0.3, 0.7, 1.0],
+        ).createShader(Rect.fromCircle(center: pos, radius: 45)),
+    );
   }
 
   void _drawPlanet(Canvas canvas, Offset pos, Color color, bool isHighlighted) {
     final radius = 24.0;
-    if (isHighlighted) canvas.drawCircle(pos, radius + 8, Paint()..color = color.withValues(alpha: 0.2)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12));
-    canvas.drawCircle(pos, radius, Paint()..shader = RadialGradient(center: const Alignment(-0.4, -0.4), colors: [color.withValues(alpha: 0.9), color.withValues(alpha: 0.6), color.withValues(alpha: 0.2), Colors.black], stops: const [0.0, 0.3, 0.7, 1.0]).createShader(Rect.fromCircle(center: pos, radius: radius)));
-    canvas.drawCircle(pos, radius, Paint()..style = PaintingStyle.stroke..color = Colors.white.withValues(alpha: 0.1)..strokeWidth = 1);
+    if (isHighlighted)
+      canvas.drawCircle(
+        pos,
+        radius + 8,
+        Paint()
+          ..color = color.withValues(alpha: 0.2)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12),
+      );
+    canvas.drawCircle(
+      pos,
+      radius,
+      Paint()
+        ..shader = RadialGradient(
+          center: const Alignment(-0.4, -0.4),
+          colors: [
+            color.withValues(alpha: 0.9),
+            color.withValues(alpha: 0.6),
+            color.withValues(alpha: 0.2),
+            Colors.black,
+          ],
+          stops: const [0.0, 0.3, 0.7, 1.0],
+        ).createShader(Rect.fromCircle(center: pos, radius: radius)),
+    );
+    canvas.drawCircle(
+      pos,
+      radius,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..color = Colors.white.withValues(alpha: 0.1)
+        ..strokeWidth = 1,
+    );
   }
 
-  void _drawMoon(Canvas canvas, Offset pos, bool isHighlighted, bool isCompleted) {
+  void _drawMoon(
+    Canvas canvas,
+    Offset pos,
+    bool isHighlighted,
+    bool isCompleted,
+  ) {
     final radius = 10.0;
     final color = isCompleted ? Colors.cyanAccent : Colors.grey.shade300;
-    canvas.drawCircle(pos, radius, Paint()..shader = RadialGradient(center: const Alignment(-0.2, -0.2), colors: [color, color.withValues(alpha: 0.5), Colors.black]).createShader(Rect.fromCircle(center: pos, radius: radius)));
-    if (isHighlighted) canvas.drawCircle(pos, radius + 5, Paint()..color = color.withValues(alpha: 0.15)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8));
-    canvas.drawCircle(pos + const Offset(2, -2), 1.5, Paint()..color = Colors.black26);
-    canvas.drawCircle(pos + const Offset(-3, 1), 1.2, Paint()..color = Colors.black26);
+    canvas.drawCircle(
+      pos,
+      radius,
+      Paint()
+        ..shader = RadialGradient(
+          center: const Alignment(-0.2, -0.2),
+          colors: [color, color.withValues(alpha: 0.5), Colors.black],
+        ).createShader(Rect.fromCircle(center: pos, radius: radius)),
+    );
+    if (isHighlighted)
+      canvas.drawCircle(
+        pos,
+        radius + 5,
+        Paint()
+          ..color = color.withValues(alpha: 0.15)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8),
+      );
+    canvas.drawCircle(
+      pos + const Offset(2, -2),
+      1.5,
+      Paint()..color = Colors.black26,
+    );
+    canvas.drawCircle(
+      pos + const Offset(-3, 1),
+      1.2,
+      Paint()..color = Colors.black26,
+    );
   }
 
   @override

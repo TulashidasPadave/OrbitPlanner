@@ -1,11 +1,11 @@
 {
-    "name": "test2",
-    "short_name": "test2",
+    "name": "Orbit Planner",
+    "short_name": "Orbit Planner",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "Orbit Planner helps you map planets, moons, and tasks in a cosmic planner.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
